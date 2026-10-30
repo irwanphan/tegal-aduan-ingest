@@ -1,0 +1,158 @@
+{
+  "name": "Meta ingest (FB / IG / WhatsApp) -> Postgres",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "meta",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "n1",
+      "name": "Meta Verify (GET)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "meta-verify"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const q = $input.first().json.query || {};\nif (q['hub.mode'] === 'subscribe' && $env.META_VERIFY_TOKEN && q['hub.verify_token'] === $env.META_VERIFY_TOKEN) {\n  return [{ json: { challenge: q['hub.challenge'] } }];\n}\nthrow new Error('Verify token Meta tidak cocok');"
+      },
+      "id": "n2",
+      "name": "Cek Verify Token",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.challenge }}",
+        "options": {}
+      },
+      "id": "n3",
+      "name": "Balas Challenge",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        480,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "meta",
+        "responseMode": "onReceived",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "n4",
+      "name": "Meta Events (POST)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        240
+      ],
+      "webhookId": "meta-events"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Logika normalisasi webhook Meta (Facebook Page, Instagram, WhatsApp Business) -> baris tabel `reports`.\n// Tanpa import: isi file ini disisipkan apa adanya ke Code node n8n oleh build-workflow.mjs.\n\nfunction verifySignature(crypto, secret, rawBody, header) {\n  if (!secret || !header || !header.startsWith('sha256=')) return false;\n  const expected = crypto.createHmac('sha256', secret).update(rawBody).digest();\n  const given = Buffer.from(header.slice(7), 'hex');\n  return given.length === expected.length && crypto.timingSafeEqual(given, expected);\n}\n\nfunction parseTime(v) {\n  if (v === undefined || v === null) return new Date().toISOString();\n  if (typeof v === 'number' || /^\\d+$/.test(String(v))) {\n    let n = Number(v);\n    if (n > 1e11) n /= 1000; // milidetik\n    return new Date(n * 1000).toISOString();\n  }\n  return new Date(String(v).replace(/([+-]\\d{2})(\\d{2})$/, '$1:$2')).toISOString();\n}\n\nfunction report(source, kind, externalId, o = {}) {\n  return {\n    source,\n    kind,\n    external_id: String(externalId),\n    parent_external_id: o.parent ? String(o.parent) : null,\n    author_id: o.authorId ? String(o.authorId) : null,\n    author_name: o.authorName || null,\n    text: o.text || '',\n    media: o.media || [],\n    permalink: o.permalink || null,\n    created_at: parseTime(o.created),\n  };\n}\n\nfunction messaging(source, entry) {\n  const out = [];\n  for (const ev of entry.messaging || []) {\n    const msg = ev.message;\n    if (!msg || msg.is_echo) continue;\n    const media = (msg.attachments || []).map((a) => ({ type: a.type, url: (a.payload || {}).url }));\n    if (!msg.text && media.length === 0) continue;\n    out.push(report(source, 'dm', msg.mid, {\n      authorId: (ev.sender || {}).id, text: msg.text, media, created: ev.timestamp,\n    }));\n  }\n  return out;\n}\n\nfunction facebook(entry) {\n  const out = messaging('facebook', entry);\n  for (const ch of entry.changes || []) {\n    if (ch.field !== 'feed') continue;\n    const v = ch.value || {};\n    if (v.verb !== 'add' && v.verb !== 'edited') continue;\n    const from = v.from || {};\n    if (v.item === 'comment' && from.id !== entry.id) {\n      out.push(report('facebook', 'comment', v.comment_id, {\n        parent: v.parent_id || v.post_id, authorId: from.id, authorName: from.name,\n        text: v.message, created: v.created_time,\n      }));\n    } else if (['post', 'status', 'photo', 'video'].includes(v.item) && v.post_id) {\n      const link = v.link || v.photo;\n      out.push(report('facebook', 'post', v.post_id, {\n        authorId: from.id, authorName: from.name, text: v.message,\n        media: v.item !== 'status' && link ? [{ type: v.item, url: link }] : [],\n        permalink: v.permalink_url, created: v.created_time,\n      }));\n    }\n  }\n  return out;\n}\n\nfunction instagram(entry) {\n  const out = messaging('instagram', entry);\n  for (const ch of entry.changes || []) {\n    if (ch.field !== 'comments') continue;\n    const v = ch.value || {};\n    const from = v.from || {};\n    if (from.id === entry.id) continue; // balasan admin sendiri\n    out.push(report('instagram', 'comment', v.id, {\n      parent: v.parent_id || (v.media || {}).id, authorId: from.id, authorName: from.username,\n      text: v.text, created: entry.time,\n    }));\n  }\n  return out;\n}\n\nfunction whatsapp(entry) {\n  const out = [];\n  for (const ch of entry.changes || []) {\n    if (ch.field !== 'messages') continue;\n    for (const m of (ch.value || {}).messages || []) {\n      const t = m.type;\n      const text = t === 'text' ? (m.text || {}).body : (m[t] || {}).caption;\n      // Media WA harus diunduh lewat Graph API dengan media id; simpan id saja.\n      const media = t && t !== 'text' ? [{ type: t, media_id: (m[t] || {}).id }] : [];\n      out.push(report('whatsapp', 'dm', m.id, { authorId: m.from, text, media, created: m.timestamp }));\n    }\n  }\n  return out;\n}\n\nconst HANDLERS = { page: facebook, instagram, whatsapp_business_account: whatsapp };\n\nfunction normalizeWebhook(payload) {\n  const handler = HANDLERS[payload.object];\n  if (!handler) return [];\n  return (payload.entry || []).flatMap(handler);\n}\n\n// Pseudonimisasi (UU PDP): hash stabil untuk semua; nama hanya untuk konten publik;\n// referensi terenkripsi (AES-256-GCM) hanya untuk DM/WA agar petugas bisa menindaklanjuti.\nfunction toRow(crypto, env, r) {\n  const priv = r.kind === 'dm';\n  const hash = r.author_id && env.HASH_SALT\n    ? crypto.createHmac('sha256', env.HASH_SALT).update(`${r.source}:${r.author_id}`).digest('hex')\n    : null;\n  let enc = null;\n  if (priv && r.author_id && env.ENCRYPTION_KEY) {\n    const iv = crypto.randomBytes(12);\n    const c = crypto.createCipheriv('aes-256-gcm', Buffer.from(env.ENCRYPTION_KEY, 'hex'), iv);\n    const body = Buffer.concat([c.update(r.author_id, 'utf8'), c.final()]);\n    enc = Buffer.concat([iv, c.getAuthTag(), body]).toString('base64');\n  }\n  const { author_id, ...rest } = r;\n  return { ...rest, author_name: priv ? null : r.author_name, author_hash: hash, author_ref_enc: enc };\n}\n\nif (typeof module !== 'undefined') module.exports = { verifySignature, normalizeWebhook, toRow, parseTime };\n\nconst crypto = require('crypto');\nconst first = $input.first();\nconst raw = await this.helpers.getBinaryDataBuffer(0, 'data');\nconst sig = (first.json.headers || {})['x-hub-signature-256'];\nif (!verifySignature(crypto, $env.META_APP_SECRET, raw, sig)) {\n  throw new Error('Tanda tangan webhook tidak valid');\n}\nconst rows = normalizeWebhook(JSON.parse(raw.toString('utf8')));\nreturn rows.map((r) => ({ json: toRow(crypto, $env, r) }));"
+      },
+      "id": "n5",
+      "name": "Verifikasi & Normalisasi",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO reports (source, kind, external_id, parent_external_id, author_hash,\n                     author_name, author_ref_enc, text, media, permalink, created_at)\nSELECT x.source, x.kind, x.external_id, x.parent_external_id, x.author_hash,\n       x.author_name, x.author_ref_enc, x.text, x.media, x.permalink, x.created_at\nFROM jsonb_to_record($1::jsonb) AS x(source text, kind text, external_id text, parent_external_id text,\n     author_hash text, author_name text, author_ref_enc text, text text, media jsonb,\n     permalink text, created_at timestamptz)\nON CONFLICT (source, kind, external_id) DO UPDATE SET text = EXCLUDED.text, media = EXCLUDED.media;",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json)] }}"
+        }
+      },
+      "id": "n6",
+      "name": "Simpan ke Postgres",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        480,
+        240
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "",
+          "name": "Postgres Tegal"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Meta Verify (GET)": {
+      "main": [
+        [
+          {
+            "node": "Cek Verify Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cek Verify Token": {
+      "main": [
+        [
+          {
+            "node": "Balas Challenge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Meta Events (POST)": {
+      "main": [
+        [
+          {
+            "node": "Verifikasi & Normalisasi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verifikasi & Normalisasi": {
+      "main": [
+        [
+          {
+            "node": "Simpan ke Postgres",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
