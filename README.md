@@ -77,3 +77,4 @@ masuk ke nomor WhatsApp Business yang didaftarkan ke Cloud API.
 ## Tidak tercakup (KAK menyebut)
 
 TikTok, SP4N-LAPOR, dan Call Center 112 punya jalur integrasi berbeda; belum dikerjakan.
+# tegal-aduan-ingest
